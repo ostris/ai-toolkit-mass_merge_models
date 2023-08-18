@@ -15,6 +15,7 @@ from safetensors.torch import save_model, save_file, load_file
 from jobs.process import BaseExtensionProcess
 from toolkit.basic import value_map
 from toolkit.config_modules import ModelConfig
+from toolkit.kohya_model_util import load_vae
 from toolkit.paths import get_path
 from toolkit.stable_diffusion_model import StableDiffusion
 from toolkit.train_tools import get_torch_dtype
@@ -45,6 +46,7 @@ def flush():
 class MassMergeModelsCSI(BaseExtensionProcess):
     loss_fn: Union[F.mse_loss, F.l1_loss, F.cosine_similarity]
     models_to_merge: List[ModelInputConfig]
+
     def __init__(
             self,
             process_id: int,
@@ -55,9 +57,11 @@ class MassMergeModelsCSI(BaseExtensionProcess):
         self.save_path = get_path(self.get_conf('save_path', required=True))
         self.working_dir = get_path(self.get_conf('working_dir', required=True))
         self.save_dtype = self.get_conf('save_dtype', default='float16')
+        self.working_dtype = self.get_conf('working_dtype', default='fp16')
         self.device = self.get_conf('device', default='cpu')
         self.report_format = self.get_conf('report_format', default='json')
         self.keep_cache = self.get_conf('keep_cache', default=False, as_type=bool)
+        self.vae_path = self.get_conf('vae_path', default=None)
         if self.report_format == 'null':
             self.report_format = None
 
@@ -94,102 +98,39 @@ class MassMergeModelsCSI(BaseExtensionProcess):
         super().run()
         print(f"Running process: {self.__class__.__name__}")
         cache_dir = os.path.join(self.working_dir, self.name, 'cache')
-        os.makedirs(cache_dir, exist_ok=True)
-
-        state_path = os.path.join(self.working_dir, self.name, 'state.json')
-        state = {
-            'models_cached': []
-        }
-        if os.path.exists(state_path):
-            with open(state_path, 'r') as f:
-                state = json.load(f)
-
-        def save_state():
-            with open(state_path, 'w') as f:
-                json.dump(state, f)
+        sim_dir_path = os.path.join(self.working_dir, 'sim_cache')
+        # os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(sim_dir_path, exist_ok=True)
 
         print("Loading base model")
         base_model: StableDiffusion = StableDiffusion(
             device=self.device,
             model_config=self.base_model,
-            dtype="float32"
+            dtype=self.working_dtype
         )
         base_model.load_model()
+        # unload stuff we dont need
+        # todo, prevent loading in the first place
+        if self.vae_path is not None:
+            del base_model.vae
+        del base_model.tokenizer
+        flush()
+
         print(f'Caching all weights to disk for each model to {self.working_dir}')
+        print(f"Computing pairwise similarity of all cached weights:")
 
-        # we have to cache to disk because each model takes up a lot of ram. There is not way to do this without
-        # caching to disk. We save each weight instead of the model to keep from loading the whole thing
-        # this allows us to merge an unlimited number of models without running out of ram
-
-        pbar = tqdm(self.models_to_merge, desc=f"Caching weights to disk")
-        failed_models = []
-        num_failed = 0
-        for idx, model_config in enumerate(self.models_to_merge):
-            if model_config.name_or_path in state['models_cached']:
-                print(f"Skipping {model_config.name_or_path} because it is already cached")
-                pbar.update(1)
-                continue
-            try:
-                # setup model class with our helper class
-                sd_model = StableDiffusion(
-                    device=self.device,
-                    model_config=model_config,
-                    dtype=self.cache_dtype
-                )
-                sd_model.load_model()
-
-                ### CACHE TEXT ENCODER ###
-
-                # adjust the weight of the text encoder
-                if isinstance(sd_model.text_encoder, list):
-                    # sdxl model
-                    base_te = base_model.text_encoder
-                    instance_te = sd_model.text_encoder
-                else:
-                    # normal model
-                    base_te = [base_model.text_encoder]
-                    instance_te = [sd_model.text_encoder]
-
-                te_num = 0
-                for text_encoder, base_text_encoder in zip(instance_te, base_te):
-                    for key, value in text_encoder.state_dict().items():
-                        # if it exists , skip it
-
-                        # subtract base model weights from the model we are merging so we don't dilute it with the base
-                        value -= base_text_encoder.state_dict()[key]
-                        file_name = f"te{te_num}_m{idx}_{key}.safetensors"
-                        v = value.detach().to('cpu', get_torch_dtype(self.cache_dtype))
-
-                        save_file({'x': v}, os.path.join(cache_dir, file_name))
-                    te_num += 1
-
-                ### CACHE UNET ###
-
-                for key, value in sd_model.unet.state_dict().items():
-                    # subtract base model weights from the model we are merging so we don't dilute it with the base
-                    value -= base_model.unet.state_dict()[key]
-                    file_name = f"unet_m{idx}_{key}.safetensors"
-                    v = value.detach().to('cpu', get_torch_dtype(self.cache_dtype))
-                    save_file({'x': v}, os.path.join(cache_dir, file_name))
-
-                del sd_model
-                del base_te
-                del instance_te
-                flush()
-                state['models_cached'].append(model_config.name_or_path)
-                save_state()
-
-            except Exception as e:
-                print(f"Failed to cache model {model_config.name_or_path} with error {e}")
-                num_failed += 1
-                # Add it to failed. Remove it after iterating
-                failed_models.append(model_config)
-            pbar.update(1)
-        # keep failed in for now to keep list in order
-        # for failed_model in failed_models:
-        #     self.models_to_merge.remove(failed_model)
-        print(f"Cached {len(self.models_to_merge) - num_failed} models to disk with {num_failed} failures")
-        print(f"Computing pairwise cosine similarity of all cached weights")
+        def get_all_keys(_model):
+            all_keys = []
+            if isinstance(_model.text_encoder, list):
+                te_list = _model.text_encoder
+            else:
+                te_list = [_model.text_encoder]
+            for te_num, te in enumerate(te_list):
+                for key in te.state_dict().keys():
+                    all_keys.append(f"te{te_num}_{key}")
+            for key in _model.unet.state_dict().keys():
+                all_keys.append(f"unet_{key}")
+            return all_keys
 
         # get all weight keys from the base model
         base_state_dict_all = {}
@@ -200,12 +141,12 @@ class MassMergeModelsCSI(BaseExtensionProcess):
             te_list = [base_model.text_encoder]
         for te_num, te in enumerate(te_list):
             for key in te.state_dict().keys():
-                te_keys.append(f"te{te_num}_m[idx]_{key}")
-                base_state_dict_all[f"te{te_num}_m[idx]_{key}"] = te.state_dict()[key]
+                te_keys.append(f"te{te_num}_{key}")
+                base_state_dict_all[f"te{te_num}_{key}"] = te.state_dict()[key]
 
-        unet_keys = [f"unet_m[idx]_{key}" for key in base_model.unet.state_dict().keys()]
+        unet_keys = [f"unet_{key}" for key in base_model.unet.state_dict().keys()]
         for key in base_model.unet.state_dict().keys():
-            base_state_dict_all[f"unet_m[idx]_{key}"] = base_model.unet.state_dict()[key]
+            base_state_dict_all[f"unet_{key}"] = base_model.unet.state_dict()[key]
 
         tensor_keys = te_keys + unet_keys
 
@@ -214,62 +155,125 @@ class MassMergeModelsCSI(BaseExtensionProcess):
         ### COMPUTE COSINE SIMILARITY ###
 
         # tensor_sim_path = os.path.join(self.working_dir, self.name, 'tensor_sim.pkl')
-        tensor_sim_path = os.path.join(self.working_dir, self.name, f'tensor_sim_{self.differential_loss}.safetensors')
-        if os.path.exists(tensor_sim_path):
-            tensor_similarities = load_file(tensor_sim_path, self.device)
-            print(f"Loaded tensor similarities from {tensor_sim_path}")
-            print(" - Checking for new items to compute")
-        else:
+        # tensor_sim_path = os.path.join(self.working_dir, self.name, f'tensor_sim_{self.differential_loss}.safetensors')
+        # if os.path.exists(tensor_sim_path):
+        #     tensor_similarities = load_file(tensor_sim_path, self.device)
+        #     print(f"Loaded tensor similarities from {tensor_sim_path}")
+        #     print(" - Checking for new items to compute")
+        # else:
 
-            tensor_similarities = {}
+        similarity_state_dict_master_cache = {}
 
-            num_similarities_added = 0
+        # if os.path.exists(similarity_state_dict_master_cache_path):
+        #     similarity_state_dict_master_cache = load_file(similarity_state_dict_master_cache_path, self.device)
+        #     print(f"Loaded similarity state dict master cache from {similarity_state_dict_master_cache_path}")
+        #     print(" - Checking for new items to compute")
 
-            pbar = tqdm(total=len(tensor_keys), desc="Computing similarity")
+        # tensor_similarities = {}
+        similarity_state_dict = {}
+        for key in tensor_keys:
+            similarity_state_dict[key] = torch.zeros(
+                (num_models, num_models), device=self.device, dtype=get_torch_dtype(self.working_dtype)
+            )
 
-            # calculate the similarity matrix for each tensor
-            for key in tensor_keys:
-                similarity_matrix = torch.zeros((num_models, num_models), device=self.device, dtype=self.cache_dtype)
+        pbar = tqdm(total=len(self.models_to_merge) * len(self.models_to_merge), desc="Computing similarity")
+        for itx_a, model_a_config in enumerate(self.models_to_merge):
+            model_a_name = os.path.splitext(os.path.basename(model_a_config.name_or_path))[0]
+            # update description
+            pbar.set_description(f"Computing: {model_a_name}")
+            model_a = None
 
-                tensors_paths = [
-                    os.path.join(
-                        cache_dir, f"{key.replace('[idx]', str(idx))}.safetensors"
-                    ) for idx in range(num_models)
-                ]
+            for itx_b, model_b_config in enumerate(self.models_to_merge):
+                model_b_name = os.path.splitext(os.path.basename(model_b_config.name_or_path))[0]
+                # always do them in alphabetical order so we dont do same comparisons
+                first_name = model_a_name if model_a_name.lower() < model_b_name.lower() else model_b_name
+                second_name = model_b_name if model_a_name.lower() < model_b_name.lower() else model_a_name
+                sim_key = f"{first_name}_{second_name}_{self.differential_loss}"
+                ssim_name = f"{sim_key}.safetensors"
+                # check if it exists
+                if sim_key in similarity_state_dict_master_cache:
+                    model_similarities = similarity_state_dict_master_cache[sim_key]
+                elif os.path.exists(os.path.join(sim_dir_path, ssim_name)):
+                    # load it
+                    model_similarities = load_file(os.path.join(sim_dir_path, ssim_name), self.device)
+                else:
+                    model_similarities = {}
+                    # load if we haven't loaded yet
+                    if model_a is None:
+                        # we need to calculate this one, load both models
+                        model_a = StableDiffusion(
+                            device=self.device,
+                            model_config=model_a_config,
+                            dtype=self.working_dtype
+                        )
+                        model_a.load_model()
+                        # unload stuff we dont need
+                        # todo, prevent loading in the first place
+                        del model_a.vae
+                        del model_a.tokenizer
 
-                for i in range(num_models):
-                    tensors_i = load_file(tensors_paths[i], self.device)['x']
-                    if self.differential_loss == 'cosine':
-                        tensors_i = tensors_i.view(1, -1)
-                    for j in range(i + 1, num_models):
-                        tensors_j = load_file(tensors_paths[j], self.device)['x']
+                    model_b = StableDiffusion(
+                        device=self.device,
+                        model_config=model_b_config,
+                        dtype=self.working_dtype
+                    )
+                    model_b.load_model()
+                    # unload stuff we dont need
+                    # todo, prevent loading in the first place
+                    del model_b.vae
+                    del model_b.tokenizer
+                    flush()
+
+                    # calculate the similarity matrix for each tensor
+                    for key in tensor_keys:
+                        base_model_weight = base_state_dict_all[key]
+                        model_a_weight = model_a.get_weight_by_name(key) - base_model_weight
+                        model_b_weight = model_b.get_weight_by_name(key) - base_model_weight
                         if self.differential_loss == 'cosine':
-                            tensors_j = tensors_j.view(1, -1)
-                            sim = self.loss_fn(tensors_i, tensors_j)
+                            model_a_weight = model_a_weight.view(1, -1)
+                            model_b_weight = model_b_weight.view(1, -1)
+                            sim = self.loss_fn(model_a_weight, model_b_weight)
                             # do abs incase it is cosine similarity
                             sim = torch.abs(sim)
                         else:
-                            sim = self.loss_fn(tensors_i, tensors_j)
-                        similarity_matrix[i, j] = sim
-                        similarity_matrix[j, i] = sim
-                        del tensors_j
-                    del tensors_i
-                    flush()
+                            sim = self.loss_fn(model_a_weight, model_b_weight)
+                        model_similarities[key] = sim.detach().to('cpu', get_torch_dtype(self.cache_dtype))
+                        # check for nans
+                        if torch.isnan(model_similarities[key]).any():
+                            # throw an error
+                            raise ValueError(f"NaN detected in similarity matrix for {key}. Try a different dtype")
 
-                tensor_similarities[key] = similarity_matrix
-                num_similarities_added += 1
+                    # save the similarity matrix to disk
+                    save_file(model_similarities, os.path.join(sim_dir_path, ssim_name))
+                    del model_b
+                    flush()
                 pbar.update(1)
 
-            pbar.close()
+                # add them to the matrix
+                for key in tensor_keys:
+                    similarity_state_dict[key][itx_a, itx_b] = model_similarities[key]
+                    similarity_state_dict[key][itx_b, itx_a] = model_similarities[key]
 
-            if num_similarities_added > 0:
-                print(f"Added {num_similarities_added} new similarities")
-                print(f"Saving tensor similarities to {tensor_sim_path}")
-                save_file(tensor_similarities, tensor_sim_path)
+            if model_a is not None:
+                del model_a
+            flush()
+
+        pbar.close()
+
+        del similarity_state_dict_master_cache
+        flush()
+
+        # if num_similarities_added > 0:
+        #     print(f"Added {num_similarities_added} new similarities")
+        #     print(f"Saving tensor similarities to {tensor_sim_path}")
+        #     save_file(tensor_similarities, tensor_sim_path)
 
         ### COMPUTE WEIGHTS FOR EACH TENSOR ###
 
         print("Reducing feature similarity matrices")
+
+        # do these calculations at float 32
+        dtype = get_torch_dtype('float32')
 
         # compute the weights for each tensor based on the similarity matrix
         tensor_weights = {}
@@ -278,26 +282,40 @@ class MassMergeModelsCSI(BaseExtensionProcess):
         # I will just continue with clustering for now
 
         # will keep the weight at minimum 10% of the model activity scaled to number of models
-        # min_model_activity = 0.1
-        # min_weight_value = min_model_activity / len(self.models_to_merge)
+        min_model_activity = 0.1
+        min_weight_value = min_model_activity / len(self.models_to_merge)
 
-        for key, similarity_matrix in tensor_similarities.items():
+        # build model weight scaler
+        model_weight_scaler = torch.ones((num_models, num_models), device=self.device, dtype=dtype)
+        for itx_a, model_a_config in enumerate(self.models_to_merge):
+            for itx_b, model_b_config in enumerate(self.models_to_merge):
+                model_weight_scaler[itx_a, itx_b] = model_a_config.weight * model_b_config.weight
+
+
+        idx = 0
+        for key, similarity_matrix in similarity_state_dict.items():
             # move minimum to 0 to compensate for negative similarities
             # similarity_matrix -= torch.min(similarity_matrix)
-            weights = torch.sum(similarity_matrix, dim=0)
-            # todo, try different scaling methods here
 
-            weights = value_map(weights, torch.min(weights), torch.max(weights), 0, 1)
+            # adjust the similarity matrix to the weights of the models
+            similarity_matrix = similarity_matrix.to(dtype) * model_weight_scaler
+
+            weights = torch.sum(similarity_matrix, dim=0)
+
+            # todo, try different scaling methods here
 
             # scale weights so the sum is 1
             weights = weights / torch.sum(weights)
 
+            print(f" - {key}: min: {torch.min(weights).item()}, max: {torch.max(weights).item()}, sum: {torch.sum(weights).item()}")
 
             # scale weights from min_weight_value to 1
             # weights = value_map(weights, 0, torch.max(weights), 0, 1)
             # weights = value_map(weights, torch.min(weights), torch.max(weights), min_weight_value, 1)
 
-            tensor_weights[key] = weights
+            tensor_weights[key] = weights.to(get_torch_dtype(self.working_dtype))
+
+            idx += 1
 
         ### WEIGHING AND MERGING ###
 
@@ -305,25 +323,38 @@ class MassMergeModelsCSI(BaseExtensionProcess):
 
         ensemble_state_dict = {}
 
-        pbar = tqdm(total=len(tensor_keys), desc="Building ensemble")
-
+        pbar = tqdm(total=len(self.models_to_merge), desc="Building ensemble")
         for key in tensor_keys:
-            weighted_sum = torch.zeros_like(base_state_dict_all[key])
+            ensemble_state_dict[key] = torch.zeros_like(base_state_dict_all[key]).to(dtype)
 
-            for idx in range(num_models):
-                tensor = \
-                    load_file(
-                        os.path.join(cache_dir, f"{key.replace('[idx]', str(idx))}.safetensors"),
-                        self.device
-                    )['x']
-                weighted_sum += tensor_weights[key][idx] * tensor
-                del tensor
-                flush()
-
-            ensemble_state_dict[key] = weighted_sum
-
-            pbar.update(1)
+        for idx, model_config in enumerate(self.models_to_merge):
+            # put model name in description
+            pbar.set_description(f"Model: {os.path.splitext(os.path.basename(model_config.name_or_path))[0]}")
+            # load model
+            model = StableDiffusion(
+                device=self.device,
+                model_config=model_config,
+                dtype=self.working_dtype
+            )
+            model.load_model()
+            # unload stuff we dont need
+            # todo, prevent loading in the first place
+            del model.vae
+            del model.tokenizer
             flush()
+
+            for key in tensor_keys:
+                tensor = model.get_weight_by_name(key)
+                # ensemble_state_dict[key] += tensor_weights[key][idx] * tensor
+                ensemble_state_dict[key] += (tensor.to(dtype) - base_state_dict_all[key].to(dtype)) * tensor_weights[key][idx]
+                # check if nan
+                if torch.isnan(ensemble_state_dict[key]).any():
+                    # throw an error
+                    raise ValueError(f"NaN detected in ensemble state dict for {key}. Try a different dtype")
+
+            del model
+            flush()
+            pbar.update(1)
 
         pbar.close()
 
@@ -337,11 +368,18 @@ class MassMergeModelsCSI(BaseExtensionProcess):
         else:
             te_list = [base_model.text_encoder]
         for te_num, te in enumerate(te_list):
+            te.to(dtype)
             for key in te.state_dict().keys():
-                te.state_dict()[key] += ensemble_state_dict[f"te{te_num}_m[idx]_{key}"]
+                te.state_dict()[key] += ensemble_state_dict[f"te{te_num}_{key}"].to(dtype)
 
+        base_model.unet.to(dtype)
         for key in base_model.unet.state_dict().keys():
-            base_model.unet.state_dict()[key] += ensemble_state_dict[f"unet_m[idx]_{key}"]
+            base_model.unet.state_dict()[key] += ensemble_state_dict[f"unet_{key}"].to(dtype)
+
+        if self.vae_path is not None:
+            print(f"Loading VAE from {self.vae_path}")
+            # load a vae model
+            base_model.vae = load_vae(self.vae_path, dtype=self.working_dtype)
 
         print(f"Saving merged model to {self.save_path}")
 
@@ -356,7 +394,7 @@ class MassMergeModelsCSI(BaseExtensionProcess):
                 weights = weights.detach().cpu().numpy()
                 # convert to list of floats
                 weights = [float(w) for w in weights]
-                clean_key = key.replace("_m[idx]", "")
+                clean_key = key
                 merge_report.setdefault(clean_key, OrderedDict())
                 for weight, model_config in zip(weights, self.models_to_merge):
                     model_path = model_config.name_or_path
@@ -371,7 +409,6 @@ class MassMergeModelsCSI(BaseExtensionProcess):
                 # sort the weight dicts by value
                 merge_report[key] = OrderedDict(sorted(weight_dict.items(), key=lambda x: x[1], reverse=True))
 
-
             save_path_no_ext = os.path.splitext(self.save_path)[0]
 
             saved_to = None
@@ -385,13 +422,6 @@ class MassMergeModelsCSI(BaseExtensionProcess):
                     saved_to = f"{save_path_no_ext}_report.json"
 
             print(f"Saved merge report to {saved_to}")
-
-        if not self.keep_cache:
-            print(f"Removing tmp directory {cache_dir}")
-            shutil.rmtree(os.path.join(self.working_dir, self.name))
-        else:
-            print(f"Keeping tmp directory {cache_dir}")
-            print(" - Be sure to manually clean it up, as it takes up a lot of space")
         del base_model
         del ensemble_state_dict
         flush()

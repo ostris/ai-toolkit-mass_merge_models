@@ -197,62 +197,73 @@ class MassMergeModelsCSI(BaseExtensionProcess):
                     # load it
                     model_similarities = load_file(os.path.join(sim_dir_path, ssim_name), self.device)
                 else:
-                    model_similarities = {}
-                    # load if we haven't loaded yet
-                    if model_a is None:
-                        # we need to calculate this one, load both models
-                        model_a = StableDiffusion(
+                    try:
+                        model_similarities = {}
+                        # load if we haven't loaded yet
+                        if model_a is None:
+                            # we need to calculate this one, load both models
+                            model_a = StableDiffusion(
+                                device=self.device,
+                                model_config=model_a_config,
+                                dtype=self.working_dtype
+                            )
+                            model_a.load_model()
+                            # unload stuff we dont need
+                            # todo, prevent loading in the first place
+                            del model_a.vae
+                            del model_a.tokenizer
+
+                        model_b = StableDiffusion(
                             device=self.device,
-                            model_config=model_a_config,
+                            model_config=model_b_config,
                             dtype=self.working_dtype
                         )
-                        model_a.load_model()
+                        model_b.load_model()
                         # unload stuff we dont need
                         # todo, prevent loading in the first place
-                        del model_a.vae
-                        del model_a.tokenizer
+                        del model_b.vae
+                        del model_b.tokenizer
+                        flush()
 
-                    model_b = StableDiffusion(
-                        device=self.device,
-                        model_config=model_b_config,
-                        dtype=self.working_dtype
-                    )
-                    model_b.load_model()
-                    # unload stuff we dont need
-                    # todo, prevent loading in the first place
-                    del model_b.vae
-                    del model_b.tokenizer
-                    flush()
+                        # calculate the similarity matrix for each tensor
+                        for key in tensor_keys:
+                            base_model_weight = base_state_dict_all[key]
+                            model_a_weight = model_a.get_weight_by_name(key) - base_model_weight
+                            model_b_weight = model_b.get_weight_by_name(key) - base_model_weight
+                            if self.differential_loss == 'cosine':
+                                model_a_weight = model_a_weight.view(1, -1)
+                                model_b_weight = model_b_weight.view(1, -1)
+                                sim = self.loss_fn(model_a_weight, model_b_weight)
+                                # do abs incase it is cosine similarity
+                                sim = torch.abs(sim)
+                            else:
+                                sim = self.loss_fn(model_a_weight, model_b_weight)
+                            model_similarities[key] = sim.detach().to('cpu', get_torch_dtype(self.cache_dtype))
+                            # check for nans
+                            if torch.isnan(model_similarities[key]).any():
+                                # throw an error
+                                raise ValueError(f"NaN detected in similarity matrix for {key}. Try a different dtype")
 
-                    # calculate the similarity matrix for each tensor
-                    for key in tensor_keys:
-                        base_model_weight = base_state_dict_all[key]
-                        model_a_weight = model_a.get_weight_by_name(key) - base_model_weight
-                        model_b_weight = model_b.get_weight_by_name(key) - base_model_weight
-                        if self.differential_loss == 'cosine':
-                            model_a_weight = model_a_weight.view(1, -1)
-                            model_b_weight = model_b_weight.view(1, -1)
-                            sim = self.loss_fn(model_a_weight, model_b_weight)
-                            # do abs incase it is cosine similarity
-                            sim = torch.abs(sim)
-                        else:
-                            sim = self.loss_fn(model_a_weight, model_b_weight)
-                        model_similarities[key] = sim.detach().to('cpu', get_torch_dtype(self.cache_dtype))
-                        # check for nans
-                        if torch.isnan(model_similarities[key]).any():
-                            # throw an error
-                            raise ValueError(f"NaN detected in similarity matrix for {key}. Try a different dtype")
-
-                    # save the similarity matrix to disk
-                    save_file(model_similarities, os.path.join(sim_dir_path, ssim_name))
-                    del model_b
+                        # save the similarity matrix to disk
+                        save_file(model_similarities, os.path.join(sim_dir_path, ssim_name))
+                        del model_b
+                    except Exception as e:
+                        print(f"Error computing similarity for {sim_key}")
+                        print(e)
+                        model_similarities = None
                     flush()
                 pbar.update(1)
 
-                # add them to the matrix
-                for key in tensor_keys:
-                    similarity_state_dict[key][itx_a, itx_b] = model_similarities[key]
-                    similarity_state_dict[key][itx_b, itx_a] = model_similarities[key]
+                try:
+
+                    # add them to the matrix
+                    for key in tensor_keys:
+                        similarity_state_dict[key][itx_a, itx_b] = model_similarities[key]
+                        similarity_state_dict[key][itx_b, itx_a] = model_similarities[key]
+                except Exception as e:
+                    print(f"Error adding similarity for {sim_key}")
+                    print(e)
+                    raise e
 
             if model_a is not None:
                 del model_a

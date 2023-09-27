@@ -24,6 +24,8 @@ from tqdm import tqdm
 import numpy as np
 from tinydb import TinyDB, Query
 
+from .tools import get_hash_from_dict
+
 # Type check imports. Prevents circular imports
 if TYPE_CHECKING:
     from jobs import ExtensionJob
@@ -48,7 +50,6 @@ class ModelToMergeConfig:
     def __init__(self, **kwargs):
         self.name_or_path: str = kwargs.get('path', None)
         self.name_or_path: str = kwargs.get('name_or_path', self.name_or_path)
-        self.db: TinyDB = TinyDB(os.path.join(os.path.dirname(__file__), 'db.json'))
 
         self.weight: float = kwargs.get('weight', 1.0)
         mappings = kwargs.get('mappings', {})
@@ -91,6 +92,7 @@ class MassMergeAnything(BaseExtensionProcess):
         self.mappings = self.get_conf('mappings', default={}, as_type=dict)
         if self.report_format == 'null':
             self.report_format = None
+        self.db: TinyDB = TinyDB(os.path.join(os.path.dirname(__file__), 'db.json'))
 
         self.cache_dtype = self.get_conf('cache_dtype', default='float32', as_type=get_torch_dtype)
         # merge_step = self.get_conf('merge_step', default=1, as_type=int)
@@ -123,17 +125,26 @@ class MassMergeAnything(BaseExtensionProcess):
             self.base_model = ModelToMergeConfig(**self.base_model, mappings=self.mappings)
         # setup is complete. Don't load anything else here, just setup variables and stuff
 
+        self.hash_dict = OrderedDict([
+            ('differential_loss', self.differential_loss),
+        ])
+        if self.subtract_base:
+            self.hash_dict['subtract_base'] = self.subtract_base
+            self.hash_dict['base_model_path'] = self.base_model.name_or_path
+
+        self.hash = get_hash_from_dict(self.hash_dict)
+
     # this is the entire run process be sure to call super().run() first
     @torch.no_grad()
     def run(self):
-        def load_state_dict(path) -> Union[OrderedDict, dict]:
+        def load_state_dict(path, device='cpu') -> Union[OrderedDict, dict]:
             # get extension
             ext = os.path.splitext(path)[1].lower()
             if ext == '.safetensors':
-                return load_file(path, self.device)
+                return load_file(path, device)
             else:
                 # assume torch 'pt, pth, pthc'
-                model = torch.load(path, map_location=self.device)
+                model = torch.load(path, map_location=device)
                 if isinstance(model, dict):
                     return model
                 elif isinstance(model, OrderedDict):
@@ -144,6 +155,8 @@ class MassMergeAnything(BaseExtensionProcess):
         # always call first
         super().run()
         print(f"Running process: {self.__class__.__name__}")
+
+        Similarity = Query()
         sim_dir_path = os.path.join(self.working_dir, 'sim_cache')
         # os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(sim_dir_path, exist_ok=True)
@@ -155,13 +168,14 @@ class MassMergeAnything(BaseExtensionProcess):
         similarity_state_dict_master_cache = {}
 
         # load first one to get info
-        base_model = load_state_dict(self.base_model.name_or_path)
+        bade_model_device = 'cpu' if not self.subtract_base else self.device
+        base_model = load_state_dict(self.base_model.name_or_path, bade_model_device)
 
         # get all the keys
         tensor_keys = [x for x in base_model.keys()]
 
-        for key in tensor_keys:
-            base_model[key] = base_model[key].to(get_torch_dtype('float32'))
+        # for key in tensor_keys:
+        #     base_model[key] = base_model[key].to(get_torch_dtype('float32'))
 
         bad_keys = [
             'conditioner.embedders.0.transformer.text_model.embeddings.position_embedding.weight',
@@ -199,42 +213,31 @@ class MassMergeAnything(BaseExtensionProcess):
                 second_name = model_b_name if model_a_name.lower() < model_b_name.lower() else model_a_name
                 sim_key = f"{first_name}_{second_name}_{self.differential_loss}"
                 ssim_name = f"{sim_key}.safetensors"
+
+                sim_list = self.db.search(
+                    (Similarity.model_a == model_a_name) &
+                    (Similarity.model_b == model_b_name) &
+                    (Similarity.config_hash == self.hash)
+                )
+                model_similarities = {}
+
                 # check if it exists
                 if model_a_name == model_b_name:
-                    # if it is the same model, just add it to the cache
                     for key in tensor_keys:
-                        similarity_state_dict[key][itx_a, itx_b] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
-                        similarity_state_dict[key][itx_b, itx_a] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
+                        model_similarities[key] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
                     do_compute = False
-                    continue
-                if sim_key in similarity_state_dict_master_cache:
-                    model_similarities = similarity_state_dict_master_cache[sim_key]
+
+                elif len(sim_list) == len(tensor_keys):
+                    for sim in sim_list:
+                        model_similarities[sim['weight_key']] = torch.tensor(sim['similarity'], device=self.device, dtype=working_dtype)
                     do_compute = False
-                elif os.path.exists(os.path.join(sim_dir_path, ssim_name)):
-                    # load it
-                    model_similarities = load_file(os.path.join(sim_dir_path, ssim_name), self.device)
-                    found_non_zero = False
-                    # check for nans and all zeros
-                    for key in tensor_keys:
-                        if torch.isnan(model_similarities[key]).any():
-                            # throw an error
-                            raise ValueError(f"NaN detected in similarity matrix for {key}. Try a different dtype")
-                        if torch.sum(model_similarities[key]) > 0.0:
-                            found_non_zero = True
-                    if not found_non_zero:
-                        do_compute = True
-                        print(f"Models_identical {ssim_name}. Recomputing")
-                    else:
-                        do_compute = False
                 if do_compute:
-                    # try:
-                    model_similarities = {}
                     # load if we haven't loaded yet
                     if model_a is None:
                         # we need to calculate this one, load both models
-                        model_a = load_state_dict(model_a_config.name_or_path)
+                        model_a = load_state_dict(model_a_config.name_or_path, self.device)
 
-                    model_b = load_state_dict(model_b_config.name_or_path)
+                    model_b = load_state_dict(model_b_config.name_or_path, self.device)
                     # calculate the similarity matrix for each tensor
 
                     found_non_zero = False
@@ -247,30 +250,41 @@ class MassMergeAnything(BaseExtensionProcess):
                         if key_b not in model_b:
                             raise ValueError(f"Key {key_b} not found in model {model_b_config.name_or_path}")
 
-
                         try:
                             if self.subtract_base:
-                                model_a_weight = model_a[key_a].clone().float() - base_model[key].clone().float()
-                                model_b_weight = model_b[key_b].clone().float() - base_model[key].clone().float()
+                                model_a_weight = model_a[key_a] - base_model[key]
+                                model_b_weight = model_b[key_b] - base_model[key]
                             else:
-                                model_a_weight = model_a[key_a].clone().float()
-                                model_b_weight = model_b[key_b].clone().float()
+                                model_a_weight = model_a[key_a]
+                                model_b_weight = model_b[key_b]
                             if self.differential_loss == 'cosine':
-                                model_a_weight = model_a_weight.view(1, -1).to(working_dtype)
-                                model_b_weight = model_b_weight.view(1, -1).to(working_dtype)
+                                model_a_weight = model_a_weight.view(1, -1)
+                                model_b_weight = model_b_weight.view(1, -1)
                                 sim = self.loss_fn(model_a_weight, model_b_weight)
                                 # do abs incase it is cosine similarity
                                 sim = torch.abs(sim)
                             else:
-                                sim = self.loss_fn(model_a_weight.to(working_dtype), model_b_weight.to(working_dtype))
+                                sim = self.loss_fn(model_a_weight, model_b_weight)
+                            # del model_a_weight
+                            del model_b_weight
+                            del model_b[key_b]  # don't need it anymore
 
-                            if not key_a.startswith('conditioner') and not key_a.startswith('first'):
-                                a = 1
-                            model_similarities[key] = sim.detach().to('cpu', get_torch_dtype(self.cache_dtype))
-                            # check for nans
-                            if torch.isnan(model_similarities[key]).any():
+                            if torch.isnan(sim).any():
                                 # throw an error
                                 raise ValueError(f"NaN detected in similarity matrix for {key}. Try a different dtype")
+
+                            model_similarities[key] = sim.clone()
+                            sim_float = sim.detach().to('cpu').numpy().item()
+                            del sim
+                            # save it to the cache
+                            self.db.insert({
+                                'model_a': model_a_name,
+                                'model_b': model_b_name,
+                                'config_hash': self.hash,
+                                'weight_key': key,
+                                'similarity': sim_float
+                            })
+
                         except Exception as e:
                             print(f"Error computing similarity for {sim_key}")
                             print(e)
@@ -283,23 +297,29 @@ class MassMergeAnything(BaseExtensionProcess):
                         print(f"Models_identical {ssim_name} after recompute")
 
                     # save the similarity matrix to disk
-                    save_file(model_similarities, os.path.join(sim_dir_path, ssim_name))
+                    # save_file(model_similarities, os.path.join(sim_dir_path, ssim_name))
                     del model_b
                     # except Exception as e:
                     #     raise ValueError(e)
-                    flush()
+                    # flush()
                 pbar.update(1)
 
                 try:
-
                     # add them to the matrix
                     for key in tensor_keys:
-                        similarity_state_dict[key][itx_a, itx_b] = model_similarities[key]
-                        similarity_state_dict[key][itx_b, itx_a] = model_similarities[key]
+                        try:
+                            similarity_state_dict[key][itx_a, itx_b] = model_similarities[key].clone().cpu()
+                            similarity_state_dict[key][itx_b, itx_a] = model_similarities[key].clone().cpu()
+                        except Exception as e:
+                            print(f"Error adding similarity for {sim_key}")
+                            similarity_state_dict[key][itx_a, itx_b] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
+                            similarity_state_dict[key][itx_b, itx_a] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
                 except Exception as e:
                     print(f"Error adding similarity for {sim_key}")
                     print(e)
                     raise e
+                model_similarities = {}
+                flush()
 
             if model_a is not None:
                 del model_a
@@ -374,7 +394,7 @@ class MassMergeAnything(BaseExtensionProcess):
             # put model name in description
             pbar.set_description(f"Model: {os.path.splitext(os.path.basename(model_config.name_or_path))[0]}")
             # load model
-            model = load_state_dict(model_config.name_or_path)
+            model = load_state_dict(model_config.name_or_path, self.device)
             found_non_zero = False
             for key in tensor_keys:
                 key_a = model_config.get_key(key)

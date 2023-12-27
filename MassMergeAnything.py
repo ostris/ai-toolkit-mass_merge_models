@@ -16,7 +16,7 @@ from jobs.process import BaseExtensionProcess
 from toolkit.basic import value_map
 from toolkit.config_modules import ModelConfig
 from toolkit.kohya_model_util import load_vae
-from toolkit.metadata import get_meta_for_safetensors
+from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors
 from toolkit.paths import get_path
 from toolkit.stable_diffusion_model import StableDiffusion
 from toolkit.train_tools import get_torch_dtype
@@ -70,6 +70,21 @@ class ModelToMergeConfig:
             return my_key
 
 
+def max_normalize_with_reference(tensor, reference_tensor):
+    """
+    Normalize tensor using the absolute maximum value of the reference tensor.
+
+    Args:
+    - tensor (torch.Tensor): The tensor to be normalized.
+    - reference_tensor (torch.Tensor): The tensor whose absolute max value will be used for normalization.
+
+    Returns:
+    - torch.Tensor: Normalized tensor.
+    """
+    abs_max_reference = reference_tensor.abs().max()
+    return tensor * abs_max_reference / tensor.abs().max()
+
+
 # this is our main class process
 class MassMergeAnything(BaseExtensionProcess):
 
@@ -88,8 +103,13 @@ class MassMergeAnything(BaseExtensionProcess):
         self.keep_cache = self.get_conf('keep_cache', default=False, as_type=bool)
         self.subtract_base = self.get_conf('subtract_base', default=False, as_type=bool)
         self.base_layers_to_keep = self.get_conf('base_layers_to_keep', default=[], as_type=list)
+        self.base_layers_to_keep_begins_with = self.get_conf('base_layers_to_keep_begins_with', default=[],
+                                                             as_type=list)
+        self.base_layers_to_keep_contains = self.get_conf('base_layers_to_keep_contains', default=[], as_type=list)
+        self.match_base_norm = self.get_conf('match_base_norm', default=False, as_type=bool)
         self.base_alpha = self.get_conf('base_alpha', default=0.0, as_type=float)
         self.mappings = self.get_conf('mappings', default={}, as_type=dict)
+        self.use_base_meta = self.get_conf('use_base_meta', default=False, as_type=bool)
         if self.report_format == 'null':
             self.report_format = None
         self.db: TinyDB = TinyDB(os.path.join(os.path.dirname(__file__), 'db.json'))
@@ -119,6 +139,17 @@ class MassMergeAnything(BaseExtensionProcess):
         # this way you can add methods to it and it is easier to read and code. There are a lot of
         # inbuilt config classes located in toolkit.config_modules as well
         self.models_to_merge = [ModelToMergeConfig(**model, mappings=self.mappings) for model in models_to_merge]
+
+        # make sure they all exist and remove ones that dont
+        to_remove = []
+        for model in self.models_to_merge:
+            if not os.path.exists(model.name_or_path):
+                print(f"Model {model.name_or_path} not found. Removing from list")
+                to_remove.append(model)
+
+        for model in to_remove:
+            self.models_to_merge.remove(model)
+
         if self.base_model is None:
             self.base_model = self.models_to_merge[0]
         else:
@@ -179,8 +210,13 @@ class MassMergeAnything(BaseExtensionProcess):
 
         bad_keys = [
             'conditioner.embedders.0.transformer.text_model.embeddings.position_embedding.weight',
-            'conditioner.embedders.1.model.logit_scale'
+            'conditioner.embedders.1.model.logit_scale',
+            "conditioner.embedders.0.transformer.text_model.embeddings.position_ids",
+            "cond_stage_model.transformer.text_model.embeddings.position_ids"
         ]
+
+        for begin in self.base_layers_to_keep_begins_with:
+            bad_keys += [x for x in tensor_keys if x.startswith(begin)]
 
         # remove them
         for key in bad_keys:
@@ -204,7 +240,6 @@ class MassMergeAnything(BaseExtensionProcess):
             # update description
             pbar.set_description(f"Computing: {model_a_name}")
             model_a = None
-
             for itx_b, model_b_config in enumerate(self.models_to_merge):
                 do_compute = True
                 model_b_name = os.path.splitext(os.path.basename(model_b_config.name_or_path))[0]
@@ -213,24 +248,23 @@ class MassMergeAnything(BaseExtensionProcess):
                 second_name = model_b_name if model_a_name.lower() < model_b_name.lower() else model_a_name
                 sim_key = f"{first_name}_{second_name}_{self.differential_loss}"
                 ssim_name = f"{sim_key}.safetensors"
-
-                sim_list = self.db.search(
-                    (Similarity.model_a == model_a_name) &
-                    (Similarity.model_b == model_b_name) &
-                    (Similarity.config_hash == self.hash)
-                )
+                ssim_path = os.path.join(sim_dir_path, ssim_name)
                 model_similarities = {}
 
                 # check if it exists
                 if model_a_name == model_b_name:
                     for key in tensor_keys:
-                        model_similarities[key] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
+                        model_similarities[key] = torch.tensor(0.0, device='cpu', dtype=working_dtype)
                     do_compute = False
+                    similarity_state_dict[key][itx_a, itx_b] = torch.tensor(0.0, device='cpu', dtype=working_dtype)
+                    similarity_state_dict[key][itx_b, itx_a] = torch.tensor(0.0, device='cpu', dtype=working_dtype)
 
-                elif len(sim_list) == len(tensor_keys):
-                    for sim in sim_list:
-                        model_similarities[sim['weight_key']] = torch.tensor(sim['similarity'], device=self.device, dtype=working_dtype)
+                elif os.path.exists(ssim_path):
                     do_compute = False
+                    model_similarities = load_file(ssim_path, self.device)
+                    for key in tensor_keys:
+                        similarity_state_dict[key][itx_a, itx_b] = model_similarities[key].clone().cpu()
+                        similarity_state_dict[key][itx_b, itx_a] = model_similarities[key].clone().cpu()
                 if do_compute:
                     # load if we haven't loaded yet
                     if model_a is None:
@@ -241,7 +275,15 @@ class MassMergeAnything(BaseExtensionProcess):
                     # calculate the similarity matrix for each tensor
 
                     found_non_zero = False
-                    for key in tensor_keys:
+                    for key in tqdm(tensor_keys):
+                        # if the key starts with one of the base layers to keep, skip it
+                        skip = False
+                        for base_key in self.base_layers_to_keep_begins_with:
+                            if key.startswith(base_key):
+                                skip = True
+                                break
+                        if skip:
+                            continue
                         key_a = model_a_config.get_key(key)
                         key_b = model_b_config.get_key(key)
                         if key_a not in model_a:
@@ -264,7 +306,7 @@ class MassMergeAnything(BaseExtensionProcess):
                                 # do abs incase it is cosine similarity
                                 sim = torch.abs(sim)
                             else:
-                                sim = self.loss_fn(model_a_weight, model_b_weight)
+                                sim = self.loss_fn(model_a_weight.float(), model_b_weight.float())
                             # del model_a_weight
                             del model_b_weight
                             del model_b[key_b]  # don't need it anymore
@@ -274,16 +316,9 @@ class MassMergeAnything(BaseExtensionProcess):
                                 raise ValueError(f"NaN detected in similarity matrix for {key}. Try a different dtype")
 
                             model_similarities[key] = sim.clone()
-                            sim_float = sim.detach().to('cpu').numpy().item()
+                            similarity_state_dict[key][itx_a, itx_b] = model_similarities[key].clone().cpu()
+                            similarity_state_dict[key][itx_b, itx_a] = model_similarities[key].clone().cpu()
                             del sim
-                            # save it to the cache
-                            self.db.insert({
-                                'model_a': model_a_name,
-                                'model_b': model_b_name,
-                                'config_hash': self.hash,
-                                'weight_key': key,
-                                'similarity': sim_float
-                            })
 
                         except Exception as e:
                             print(f"Error computing similarity for {sim_key}")
@@ -297,27 +332,28 @@ class MassMergeAnything(BaseExtensionProcess):
                         print(f"Models_identical {ssim_name} after recompute")
 
                     # save the similarity matrix to disk
-                    # save_file(model_similarities, os.path.join(sim_dir_path, ssim_name))
+                    save_file(model_similarities, os.path.join(sim_dir_path, ssim_name))
                     del model_b
+                    del model_similarities
                     # except Exception as e:
                     #     raise ValueError(e)
                     # flush()
                 pbar.update(1)
 
-                try:
-                    # add them to the matrix
-                    for key in tensor_keys:
-                        try:
-                            similarity_state_dict[key][itx_a, itx_b] = model_similarities[key].clone().cpu()
-                            similarity_state_dict[key][itx_b, itx_a] = model_similarities[key].clone().cpu()
-                        except Exception as e:
-                            print(f"Error adding similarity for {sim_key}")
-                            similarity_state_dict[key][itx_a, itx_b] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
-                            similarity_state_dict[key][itx_b, itx_a] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
-                except Exception as e:
-                    print(f"Error adding similarity for {sim_key}")
-                    print(e)
-                    raise e
+                # try:
+                #     # add them to the matrix
+                #     for key in tensor_keys:
+                #         try:
+                #             similarity_state_dict[key][itx_a, itx_b] = model_similarities[key].clone().cpu()
+                #             similarity_state_dict[key][itx_b, itx_a] = model_similarities[key].clone().cpu()
+                #         except Exception as e:
+                #             print(f"Error adding similarity for {sim_key}")
+                #             similarity_state_dict[key][itx_a, itx_b] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
+                #             similarity_state_dict[key][itx_b, itx_a] = torch.tensor(0.0, device=self.device, dtype=working_dtype)
+                # except Exception as e:
+                #     print(f"Error adding similarity for {sim_key}")
+                #     print(e)
+                #     raise e
                 model_similarities = {}
                 flush()
 
@@ -382,9 +418,13 @@ class MassMergeAnything(BaseExtensionProcess):
 
         for key in tensor_keys:
             if self.subtract_base:
-                ensemble_state_dict[key] = base_model[key].clone().detach()
+                ensemble_state_dict[key] = base_model[key].clone().detach().to(dtype=working_dtype, device=self.device)
             else:
-                ensemble_state_dict[key] = torch.zeros_like(base_model[key])
+                ensemble_state_dict[key] = torch.zeros_like(base_model[key]).to(dtype=working_dtype, device=self.device)
+        # see if bad keys are in base and add them if they are
+        for key in bad_keys:
+            if key in base_model:
+                ensemble_state_dict[key] = base_model[key].clone().detach().to(dtype=working_dtype, device=self.device)
 
         pbar = tqdm(total=len(self.models_to_merge), desc="Merging")
 
@@ -399,12 +439,19 @@ class MassMergeAnything(BaseExtensionProcess):
             for key in tensor_keys:
                 key_a = model_config.get_key(key)
 
-                if key in self.base_layers_to_keep:
+                if key in self.base_layers_to_keep or key.startswith(
+                        tuple(self.base_layers_to_keep_begins_with)) or any(
+                    x in key for x in self.base_layers_to_keep_contains):
                     # just use base
-                    ensemble_state_dict[key] = base_model[key].clone().detach()
+                    ensemble_state_dict[key] = base_model[key].clone().detach().to(dtype=working_dtype,
+                                                                                   device=self.device)
                     tensor_weights[key][idx] *= 0.0
                     continue
-                tensor = model[key_a]
+                if key_a not in model:
+                    print(f"Key {key_a} not found in model {model_config.name_or_path}")
+                    tensor = base_model[key].clone().detach().to(dtype=working_dtype, device=self.device)
+                else:
+                    tensor = model[key_a].to(dtype=working_dtype, device=self.device)
                 # ensemble_state_dict[key] += tensor_weights[key][idx] * tensor
                 tensor_w = tensor_weights[key][idx]
 
@@ -414,9 +461,15 @@ class MassMergeAnything(BaseExtensionProcess):
                     # tensor_w = 1.0 / len(self.models_to_merge)
 
                 if self.subtract_base:
-                    tensor = tensor - base_model[key]
+                    tensor = tensor - base_model[key].clone().detach().to(dtype=working_dtype, device=self.device)
 
                 ensemble_state_dict[key] += (tensor * tensor_w) * beta
+
+                if self.match_base_norm:
+                    ensemble_state_dict[key] = max_normalize_with_reference(
+                        ensemble_state_dict[key],
+                        base_model[key].clone().detach().to(dtype=working_dtype, device=self.device)
+                    )
                 # check if nan
                 if torch.isnan(ensemble_state_dict[key]).any():
                     # throw an error
@@ -438,7 +491,10 @@ class MassMergeAnything(BaseExtensionProcess):
         for key, tensor in ensemble_state_dict.items():
             save_state_dict[key] = tensor.clone().detach().to('cpu', get_torch_dtype(self.save_dtype))
 
-        save_meta = get_meta_for_safetensors(self.meta, self.job.name)
+        if self.use_base_meta:
+            save_meta = load_metadata_from_safetensors(self.base_model.name_or_path)
+        else:
+            save_meta = get_meta_for_safetensors(self.meta, self.job.name)
 
         if self.save_path.endswith('.safetensors'):
             save_file(save_state_dict, self.save_path, save_meta)
